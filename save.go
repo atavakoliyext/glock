@@ -213,7 +213,8 @@ func setToSlice(set map[string]struct{}) []string {
 }
 
 // filterPackages accepts the output of a go list comment (one package per line)
-// and returns a set of package import paths, excluding standard library.
+// and returns a set of package import paths, excluding standard library and any
+// vendored packages.
 // Additionally, any packages present in the "exclude" set will be excluded.
 func filterPackages(output []byte, exclude map[string]struct{}) map[string]struct{} {
 	var scanner = bufio.NewScanner(bytes.NewReader(output))
@@ -223,8 +224,12 @@ func filterPackages(output []byte, exclude map[string]struct{}) map[string]struc
 			pkg    = scanner.Text()
 			slash  = strings.Index(pkg, "/")
 			stdLib = slash == -1 || strings.Index(pkg[:slash], ".") == -1
+			vendor = strings.Index(pkg, "/vendor/") != -1
 		)
 		if stdLib {
+			continue
+		}
+		if vendor {
 			continue
 		}
 		if _, ok := exclude[pkg]; ok {
