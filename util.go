@@ -4,10 +4,16 @@ import (
 	"fmt"
 	"go/build"
 	"io"
+	"io/ioutil"
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
+
+	"golang.org/x/mod/modfile"
 )
+
+var majorVersionSuffix = regexp.MustCompile(`/v[\d]+$`)
 
 // managedRepo is the repo being managed by glock (where the GLOCKFILE resides)
 // Like repoRoot, except managedRepo is allowed to be outside the GOPATH.
@@ -167,4 +173,30 @@ func debug(args ...interface{}) {
 	if buildV {
 		fmt.Fprintln(os.Stderr, args...)
 	}
+}
+
+// repoPathFromImportPath returns the repo path for the given import path. This
+// is usually just importPath with any major-version suffix trimmed, but future
+// implementations may use use more sophisticated approaches, like querying a
+// module-aware goproxy.
+func repoPathFromImportPath(importPath string) string {
+	return majorVersionSuffix.ReplaceAllString(importPath, "")
+}
+
+// hasMajorVersionSuffix returns true if importPath has a major version suffix.
+func hasMajorVersionSuffix(importPath string) bool {
+	return majorVersionSuffix.MatchString(importPath)
+}
+
+// readGoModFile returns the parsed go.mod rooted at the given path. If go.mod
+// is not found in the given path, nil is returned.
+func readGoModFile(root string) (*modfile.File, error) {
+	path := filepath.Join(root, "go.mod")
+	data, err := ioutil.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil, nil
+	} else if err != nil {
+		return nil, err
+	}
+	return modfile.ParseLax(path, data, nil)
 }

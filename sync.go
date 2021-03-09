@@ -5,14 +5,11 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"path/filepath"
 	"os"
-	"regexp"
 	"strings"
 
 	"github.com/agtorre/gocolorize"
-	"golang.org/x/mod/modfile"
 )
 
 var cmdSync = &Command{
@@ -44,13 +41,17 @@ var (
 	critical = gocolorize.NewColor("red").Paint
 
 	disabled = func(args ...interface{}) string { return fmt.Sprint(args...) }
-
-	majorVersionSuffix = regexp.MustCompile(`/v[\d]+$`)
 )
 
 // Running too many syncs at once can exhaust file descriptor limits.
 // Empirically, ~90 is enough to hit the macOS default limit of 256.
 const maxConcurrentSyncs = 25
+
+type pkgSpec struct {
+	importPath       string
+	repoPath         string
+	expectedRevision string
+}
 
 func init() {
 	cmdSync.Run = runSync // break init loop
@@ -75,9 +76,6 @@ func runSync(cmd *Command, args []string) {
 		critical = disabled
 	}
 
-	type pkgSpec struct {
-		importPath, expectedRevision string
-	}
 	var pkgSpecs []pkgSpec
 	var cmds []string
 	var scanner = bufio.NewScanner(glockfile)
@@ -87,8 +85,12 @@ func runSync(cmd *Command, args []string) {
 			cmds = append(cmds, fields[1])
 			continue
 		}
-		var importPath, expectedRevision = fields[0], truncate(fields[1])
-		pkgSpecs = append(pkgSpecs, pkgSpec{importPath, expectedRevision})
+		var (
+			importPath       = fields[0]
+			repoPath         = repoPathFromImportPath(importPath)
+			expectedRevision = truncate(fields[1])
+		)
+		pkgSpecs = append(pkgSpecs, pkgSpec{importPath, repoPath, expectedRevision})
 	}
 	if scanner.Err() != nil {
 		perror(scanner.Err())
@@ -96,7 +98,7 @@ func runSync(cmd *Command, args []string) {
 
 	getArgs := []string{"get", "-v", "-d"}
 	for _, pkgSpec := range pkgSpecs {
-		getArgs = append(getArgs, pkgSpec.importPath)
+		getArgs = append(getArgs, pkgSpec.repoPath)
 	}
 
 	// `go get` all the packages at once (rather than in parallel) since it is
@@ -120,7 +122,7 @@ func runSync(cmd *Command, args []string) {
 
 		go func() {
 			sem <- struct{}{}
-			syncPkg(ch, pkgSpec.importPath, pkgSpec.expectedRevision, string(getOutput), getErr)
+			syncPkg(ch, pkgSpec, string(getOutput), getErr)
 			<-sem
 		}()
 	}
@@ -157,19 +159,23 @@ func truncate(rev string) string {
 	return rev
 }
 
-func syncPkg(ch chan<- string, importPath, expectedRevision, getOutput string, getErr error) {
-	var importDir = filepath.Join(gopaths()[0], "src", importPath)
-	var status bytes.Buffer
+func syncPkg(ch chan<- string, spec pkgSpec, getOutput string, getErr error) {
+	var (
+		repoDir  = filepath.Join(gopaths()[0], "src", spec.repoPath)
+
+		status bytes.Buffer
+	)
+
 	defer func() { ch <- status.String() }()
 
 	defer func() {
-		if err := maybeLinkModulePath(importPath); err != nil {
+		if err := maybeLinkModulePath(spec); err != nil {
 			perror(err)
 		}
 	}()
 
 	// Try to find the repo.
-	var repo, err = fastRepoRoot(importPath)
+	var repo, err = fastRepoRoot(spec.repoPath)
 	if err != nil {
 		var getStatus = "(success)"
 		if getErr != nil {
@@ -181,11 +187,11 @@ func syncPkg(ch chan<- string, importPath, expectedRevision, getOutput string, g
 %s
 
 > import %s
-%s`, importPath, importPath, getStatus, importPath, err))
+%s`, spec.repoPath, spec.repoPath, getStatus, spec.repoPath, err))
 	}
 
 	var maybeGot = ""
-	if strings.Contains(getOutput, importPath+" (download)") {
+	if strings.Contains(getOutput, spec.repoPath+" (download)") {
 		maybeGot = warning("get ")
 	}
 
@@ -196,25 +202,25 @@ func syncPkg(ch chan<- string, importPath, expectedRevision, getOutput string, g
 	}
 
 	actualRevision = truncate(actualRevision)
-	fmt.Fprintf(&status, "%-50.49s %-12.12s\t", importPath, actualRevision)
-	if expectedRevision == actualRevision {
+	fmt.Fprintf(&status, "%-50.49s %-12.12s\t", spec.repoPath, actualRevision)
+	if spec.expectedRevision == actualRevision {
 		fmt.Fprint(&status, "[", maybeGot, info("OK"), "]\n")
 		return
 	}
 
-	fmt.Fprintln(&status, "["+maybeGot+warning(fmt.Sprintf("checkout %-12.12s", expectedRevision))+"]")
+	fmt.Fprintln(&status, "["+maybeGot+warning(fmt.Sprintf("checkout %-12.12s", spec.expectedRevision))+"]")
 
 	// Checkout the expected revision.  Don't use tagSync because it runs "git show-ref"
 	// which returns error if the revision does not correspond to a tag or head.  If we receive an error,
 	// it might be because the local repository is behind the remote, so don't error immediately.
-	err = repo.vcs.run(importDir, repo.vcs.tagSyncCmd, "tag", expectedRevision)
+	err = repo.vcs.run(repoDir, repo.vcs.tagSyncCmd, "tag", spec.expectedRevision)
 	if err == nil {
 		return
 	}
 
 	// If we didn't just get this package, download it now to update.
 	if maybeGot == "" {
-		err = repo.vcs.download(importDir)
+		err = repo.vcs.download(repoDir)
 		if err != nil {
 			perror(err)
 		}
@@ -223,14 +229,14 @@ func syncPkg(ch chan<- string, importPath, expectedRevision, getOutput string, g
 	// Checkout the expected revision, which is expected to be there now that we're up-to-date with the remote.
 	// Don't use tagSync because it runs "git show-ref" which returns error if the revision does not correspond to a
 	// tag or head.
-	err = repo.vcs.run(importDir, repo.vcs.tagSyncCmd, "tag", expectedRevision)
+	err = repo.vcs.run(repoDir, repo.vcs.tagSyncCmd, "tag", spec.expectedRevision)
 	if err != nil {
 		perror(err)
 	}
 }
 
 // maybeLinkModulePath creates a self-referencing major-release symlink in the
-// specified import path, if the import contains a go.mod whose module name
+// specified spec's repo path, if the repo contains a go.mod whose module name
 // includes a major release suffix.
 //
 // For example, suppose rsc.io/quote is imported at its v2.0.0 tag; because this
@@ -238,50 +244,40 @@ func syncPkg(ch chan<- string, importPath, expectedRevision, getOutput string, g
 // a symlink (rsc.io/quote/v2 => rsc.io/quote) is created. This allows code to
 // import the more go-module-friendly "rsc.io/quote/v2" path instead of the
 // legacy "rsc.io/quote" path.
-func maybeLinkModulePath(importPath string) error {
-	var importDir = filepath.Join(gopaths()[0], "src", importPath)
+func maybeLinkModulePath(spec pkgSpec) error {
+	var repoDir = filepath.Join(gopaths()[0], "src", spec.repoPath)
 
-	goModPath := filepath.Join(importDir, "go.mod")
-	data, err := ioutil.ReadFile(goModPath)
-	if os.IsNotExist(err) {
+	goModFile, err := readGoModFile(repoDir)
+	if goModFile == nil {
 		// No go.mod, so nothing to do.
 		return nil
 	} else if err != nil {
 		return err
 	}
 
-	goModFile, err := modfile.ParseLax(goModPath, data, nil)
-	if err != nil {
-		return err
+	// If the module path doesn't match the import path, creating the versioned
+	// symlink won't help, so warn & return.
+	if spec.importPath != goModFile.Module.Mod.Path {
+		debug(warning("[WARN]"), "import path", spec.importPath, "conflicts with go.mod path", goModFile.Module.Mod.Path)
+		return nil
 	}
 
 	// Check if the module doesn't point to an implicit major release,
 	// in which case, do nothing except maybe warn if the GLOCKFILE import path
 	// doesn't match the module name in its go.mod.
-	if !majorVersionSuffix.MatchString(goModFile.Module.Mod.Path) {
-		if importPath != goModFile.Module.Mod.Path {
-			debug(warning("[WARN]"), "import path", importPath, "conflicts with go.mod path", goModFile.Module.Mod.Path)
-		}
+	if !hasMajorVersionSuffix(goModFile.Module.Mod.Path) {
 		return nil
 	}
 
-	// If the version-less module path doesn't match the import path, creating
-	// the versioned symlink won't help, so warn & return.
-	moduleBasePath, ver := filepath.Split(goModFile.Module.Mod.Path)
-	moduleBasePath = strings.TrimRight(moduleBasePath, string(filepath.Separator))
-	if importPath != moduleBasePath {
-		debug(warning("[WARN]"), "import path", importPath, "conflicts with go.mod path", goModFile.Module.Mod.Path)
-		return nil
-	}
-
-	symlinkPath := filepath.Join(importDir, ver)
+	_, ver := filepath.Split(goModFile.Module.Mod.Path)
+	symlinkPath := filepath.Join(repoDir, ver)
 	_, err = os.Lstat(symlinkPath)
 	if !os.IsNotExist(err) {
 		if err != nil {
 			return err
 		}
 
-		if same, err := sameFile(symlinkPath, importDir); err != nil {
+		if same, err := sameFile(symlinkPath, repoDir); err != nil {
 			return err
 		} else if same {
 			// Valid symlink already exists; nothing to do
@@ -297,6 +293,6 @@ func maybeLinkModulePath(importPath string) error {
 	if err := os.Symlink(".", symlinkPath); err != nil {
 		return err
 	}
-	debug(info("[INFO]"), "created symlink", symlinkPath, "=>", importPath)
+	debug(info("[INFO]"), "created symlink", symlinkPath, "=>", spec.repoPath)
 	return nil
 }

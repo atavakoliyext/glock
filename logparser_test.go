@@ -96,6 +96,12 @@ var tests = []struct {
 		{add, "code.google.com/p/log4go", "4794f7baff22"},
 	}}},
 
+	{"add dep with major revision suffix", []string{`
++code.google.com/p/log4go/v2 4794f7baff22
+`}, playbook{library: []libraryAction{
+		{add, "code.google.com/p/log4go", "4794f7baff22"},
+	}}},
+
 	{"remove dep", []string{`
 -code.google.com/p/log4go 4794f7baff22
 `}, playbook{library: []libraryAction{

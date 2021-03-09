@@ -61,7 +61,7 @@ func readDiffLines(reader io.Reader) []diff {
 		var txt = scanner.Text()
 		if matches := libLineRegex.FindStringSubmatch(txt); matches != nil {
 			diffs = append(diffs, diff{
-				importPath: matches[1],
+				importPath: repoPathFromImportPath(matches[1]),
 				revision:   matches[2],
 				added:      txt[0] == '+',
 			})

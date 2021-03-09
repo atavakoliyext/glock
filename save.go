@@ -26,11 +26,15 @@ It writes this state to a file in the root of the package called "GLOCKFILE".
 Options:
 
 	-n	print to stdout instead of writing to file.
+	-m	print module paths instead of repository paths.
 
 `,
 }
 
-var saveN = cmdSave.Flag.Bool("n", false, "Don't save the file, just print to stdout")
+var (
+	saveN = cmdSave.Flag.Bool("n", false, "Don't save the file, just print to stdout")
+	saveM = cmdSave.Flag.Bool("m", false, "Print module paths instead of repository paths")
+)
 
 func init() {
 	cmdSave.Run = runSave // break init loop
@@ -66,14 +70,49 @@ func outputCmds(w io.Writer, cmds []string) {
 	}
 }
 
-func outputDeps(w io.Writer, depRoots []*repoRoot) {
-	for _, repoRoot := range depRoots {
-		revision, err := repoRoot.vcs.head(repoRoot.path, repoRoot.repo)
-		if err != nil {
+// depOutputLine returns the line that would be written to a GLOCKFILE for the
+// given repo root. If asModule is true, a module path is written if possible
+// (i.e. if the repo path matches the module path without any version suffixes).
+func depOutputLine(root *repoRoot, asModule bool) (string, error) {
+	revision, err := root.vcs.head(root.path, root.repo)
+	if err != nil {
+		return "", err
+	}
+	revision = strings.TrimSpace(revision)
+
+	dep := root.root
+	if asModule {
+		if goModFile, err := readGoModFile(root.path); err != nil {
 			perror(err)
+		} else if goModFile != nil {
+			modPath := goModFile.Module.Mod.Path
+			// Don't use the module path if it doesn't match the fetch path
+			// e.g. root.root == rsc.io/quote,         modPath == rsc.io/quote/v3 [GOOD]
+			//      root.root == github.com/rsc/quote, modPath == rsc.io/quote/v3 [BAD]
+			if p, _ := pathWithoutMajorVersion(modPath); p == root.root {
+				dep = modPath
+			}
 		}
-		revision = strings.TrimSpace(revision)
-		fmt.Fprintln(w, repoRoot.root, revision)
+	}
+	return fmt.Sprint(dep, " ", revision), nil
+}
+
+func outputDeps(w io.Writer, depRoots []*repoRoot) {
+	var chans []chan string
+	for _, root := range depRoots {
+		root := root
+		var ch = make(chan string, 1)
+		chans = append(chans, ch)
+		go func() {
+			if line, err := depOutputLine(root, *saveM); err != nil {
+				perror(err)
+			} else {
+				ch <- line
+			}
+		}()
+	}
+	for _, ch := range chans {
+		fmt.Fprintln(w, <-ch)
 	}
 }
 
